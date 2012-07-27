@@ -13,8 +13,8 @@
 
 typedef struct {
   /* Host data */
-  gint *buffer_matrix;
-  gint *labels_matrix;
+  guint16 *buffer_matrix;
+  guint *labels_matrix;
   gint *mD;
 
   cl_platform_id platform;
@@ -25,6 +25,8 @@ typedef struct {
 
   cl_mem buffer_matrix_device;
   cl_mem labels_matrix_device;
+  cl_mem edge_matrix_device;
+  cl_mem weight_matrix_device;
   cl_mem mD_device;
 
   cl_kernel initialize_labels;
@@ -443,15 +445,15 @@ ocl_init (oclCclData *data,
       /* Load an build OpenCL program */
       /* FIXME hardcoded file name */
       data->program = load_and_build_program (data->context, data->device,
-          "/home/iaguis/igalia/test-skeltrack/ccl.cl");
+          "/home/iaguis/igalia/test-labeling-opencl/ccl.cl");
 
       /* Device buffers creation */
       data->buffer_matrix_device = clCreateBuffer (data->context,
-          CL_MEM_READ_ONLY, sizeof(gint) * matrix_size, NULL, &err_num);
+          CL_MEM_READ_ONLY, sizeof(guint16) * matrix_size, NULL, &err_num);
       check_error (err_num, CL_SUCCESS);
 
       data->labels_matrix_device = clCreateBuffer (data->context,
-          CL_MEM_READ_WRITE, sizeof(gint) * matrix_size, NULL, &err_num);
+          CL_MEM_READ_WRITE, sizeof(guint) * matrix_size, NULL, &err_num);
       check_error (err_num, CL_SUCCESS);
 
       data->mD_device = clCreateBuffer (data->context, CL_MEM_READ_WRITE,
@@ -484,7 +486,7 @@ gint round_worksize_up(gint group_size, gint global_size)
 
 void
 ocl_ccl (oclCclData *data,
-         gint *buffer,
+         guint16 *buffer,
          gint width,
          gint height)
 {
@@ -497,7 +499,8 @@ ocl_ccl (oclCclData *data,
   size = width * height;
 
   data->buffer_matrix = buffer;
-  data->labels_matrix = g_slice_alloc (size * sizeof(gint));
+  data->labels_matrix = g_slice_alloc (size * sizeof(guint));
+  *(data->mD) = 0;
 
   local_worksize[0] = 16;
   local_worksize[1] = 16;
@@ -515,8 +518,8 @@ ocl_ccl (oclCclData *data,
       &width);
   err_num |= clSetKernelArg (data->mesh_kernel, 4, sizeof(gint),
       &height);
-  err_num |= clSetKernelArg (data->mesh_kernel, 5, sizeof(gint) *
-      local_worksize[0] * local_worksize[1], NULL);
+/*  err_num |= clSetKernelArg (data->mesh_kernel, 5, sizeof(gint) *
+      local_worksize[0] * local_worksize[1], NULL); */
   check_error (err_num, CL_SUCCESS);
 
   err_num |= clSetKernelArg (data->initialize_labels, 0, sizeof(cl_mem),
@@ -526,12 +529,12 @@ ocl_ccl (oclCclData *data,
 
   // Copy new data to device
   err_num = clEnqueueWriteBuffer (data->command_queue,
-      data->buffer_matrix_device, CL_FALSE, 0, sizeof (gint) * size,
+      data->buffer_matrix_device, CL_FALSE, 0, sizeof (guint16) * size,
       data->buffer_matrix, 0, NULL, NULL);
   check_error (err_num, CL_SUCCESS);
 
   err_num = clEnqueueWriteBuffer (data->command_queue,
-      data->labels_matrix_device, CL_FALSE, 0, sizeof (gint) * size,
+      data->labels_matrix_device, CL_FALSE, 0, sizeof (guint) * size,
       data->labels_matrix, 0, NULL, NULL);
   check_error (err_num, CL_SUCCESS);
 
@@ -544,9 +547,28 @@ ocl_ccl (oclCclData *data,
   err_num = clEnqueueNDRangeKernel (data->command_queue,
       data->initialize_labels, 1, NULL, &init_worksize, NULL, 0, NULL, NULL);
   check_error (err_num, CL_SUCCESS);
+/*
+  err_num = clEnqueueReadBuffer (data->command_queue,
+      data->labels_matrix_device, CL_FALSE, 0, sizeof(gint) * size,
+      data->labels_matrix, 0, NULL, &read_done);
 
-  while (data->mD)
+  clWaitForEvents(1, &read_done);
+
+  int i;
+  for (i=0; i<size; i++)
+  {
+    printf("%d ",data->labels_matrix[i]);
+  }
+
+  printf("\n\n\n");
+*/
+  do
     {
+      *(data->mD) = 0;
+      err_num = clEnqueueWriteBuffer (data->command_queue, data->mD_device,
+      CL_FALSE, 0, sizeof(gint), data->mD, 0, NULL, NULL);
+      check_error (err_num, CL_SUCCESS);
+
       err_num = clEnqueueNDRangeKernel (data->command_queue, data->mesh_kernel,
           2, NULL, global_worksize, local_worksize, 0, NULL, NULL);
       check_error (err_num, CL_SUCCESS);
@@ -557,13 +579,14 @@ ocl_ccl (oclCclData *data,
       check_error (err_num, CL_SUCCESS);
 
       clWaitForEvents (1, &read_done);
-    }
+    } while (*(data->mD));
   err_num = clEnqueueReadBuffer (data->command_queue,
-      data->labels_matrix_device, CL_FALSE, 0, sizeof (gint) * size,
+      data->labels_matrix_device, CL_FALSE, 0, sizeof (guint) * size,
       data->labels_matrix, 0, NULL, &read_done);
   check_error (err_num, CL_SUCCESS);
 
   clWaitForEvents (1, &read_done);
+
 
   return;
 }
@@ -581,10 +604,7 @@ int main(int argc, char **argv)
     return -1;
 
   guint16 *buffer;
-  guint width, height, reduced_width, reduced_height;
-
-  width = 640;
-  height = 480;
+  guint reduced_width, reduced_height;
 
   data = g_slice_alloc0 (sizeof(oclCclData));
   data->mD = g_slice_alloc0 (sizeof(gint));
@@ -598,7 +618,7 @@ int main(int argc, char **argv)
   int i, j;
   for (i=0; i<reduced_width; i++) {
     for (j=0; j<reduced_height; j++) {
-      printf("%d ", data->labels_matrix[j*reduced_width + i]);
+      printf("%u ", data->labels_matrix[j*reduced_width + i]);
     }
     printf("\n");
   }
