@@ -16,6 +16,8 @@ typedef struct {
   guint16 *buffer_matrix;
   guint *labels_matrix;
   gint *mD;
+  gint *edge_matrix;
+  gint *weight_matrix;
 
   cl_platform_id platform;
   cl_device_id device;
@@ -29,8 +31,9 @@ typedef struct {
   cl_mem weight_matrix_device;
   cl_mem mD_device;
 
-  cl_kernel initialize_labels;
+  cl_kernel initialize;
   cl_kernel mesh_kernel;
+  cl_kernel make_graph_kernel;
 } oclCclData;
 
 void
@@ -460,12 +463,24 @@ ocl_init (oclCclData *data,
           sizeof(gint), NULL, &err_num);
       check_error (err_num, CL_SUCCESS);
 
+      data->edge_matrix_device = clCreateBuffer (data->context,
+          CL_MEM_READ_WRITE, sizeof(gint) * matrix_size * 8, NULL, &err_num);
+      check_error (err_num, CL_SUCCESS);
+
+      data->weight_matrix_device = clCreateBuffer (data->context,
+          CL_MEM_READ_WRITE, sizeof(gint) * matrix_size * 8, NULL, &err_num);
+      check_error (err_num, CL_SUCCESS);
+
       /* Create kernels */
-      data->initialize_labels = clCreateKernel (data->program,
-          "initialize_labels", &err_num);
+      data->initialize = clCreateKernel (data->program,
+          "initialize", &err_num);
       check_error (err_num, CL_SUCCESS);
 
       data->mesh_kernel = clCreateKernel (data->program, "mesh_kernel", &err_num);
+      check_error (err_num, CL_SUCCESS);
+
+      data->make_graph_kernel = clCreateKernel (data->program, "make_graph",
+          &err_num);
       check_error (err_num, CL_SUCCESS);
     }
 }
@@ -501,6 +516,15 @@ ocl_ccl (oclCclData *data,
   data->buffer_matrix = buffer;
   data->labels_matrix = g_slice_alloc (size * sizeof(guint));
   *(data->mD) = 0;
+  data->edge_matrix = g_slice_alloc0 (size * sizeof(gint) * 8);
+  data->weight_matrix = g_slice_alloc0 (size * sizeof(gint) * 8);
+
+  int i;
+  for (i=0; i<size*8; i++)
+    {
+      data->edge_matrix[i] = -1;
+      data->weight_matrix[i] = -1;
+    }
 
   local_worksize[0] = 16;
   local_worksize[1] = 16;
@@ -522,9 +546,13 @@ ocl_ccl (oclCclData *data,
       local_worksize[0] * local_worksize[1], NULL); */
   check_error (err_num, CL_SUCCESS);
 
-  err_num |= clSetKernelArg (data->initialize_labels, 0, sizeof(cl_mem),
+  err_num |= clSetKernelArg (data->initialize, 0, sizeof(cl_mem),
       &(data->labels_matrix_device));
-  err_num |= clSetKernelArg (data->initialize_labels, 1, sizeof(gint), &size);
+  err_num |= clSetKernelArg (data->initialize, 1, sizeof(cl_mem),
+      &(data->edge_matrix_device));
+  err_num |= clSetKernelArg (data->initialize, 2, sizeof(cl_mem),
+      &(data->weight_matrix_device));
+  err_num |= clSetKernelArg (data->initialize, 3, sizeof(gint), &size);
   check_error (err_num, CL_SUCCESS);
 
   // Copy new data to device
@@ -545,23 +573,9 @@ ocl_ccl (oclCclData *data,
   init_worksize = size;
 
   err_num = clEnqueueNDRangeKernel (data->command_queue,
-      data->initialize_labels, 1, NULL, &init_worksize, NULL, 0, NULL, NULL);
+      data->initialize, 1, NULL, &init_worksize, NULL, 0, NULL, NULL);
   check_error (err_num, CL_SUCCESS);
-/*
-  err_num = clEnqueueReadBuffer (data->command_queue,
-      data->labels_matrix_device, CL_FALSE, 0, sizeof(gint) * size,
-      data->labels_matrix, 0, NULL, &read_done);
 
-  clWaitForEvents(1, &read_done);
-
-  int i;
-  for (i=0; i<size; i++)
-  {
-    printf("%d ",data->labels_matrix[i]);
-  }
-
-  printf("\n\n\n");
-*/
   do
     {
       *(data->mD) = 0;
@@ -587,8 +601,58 @@ ocl_ccl (oclCclData *data,
 
   clWaitForEvents (1, &read_done);
 
-
   return;
+}
+
+void ocl_make_graph (oclCclData *data, int width, int height, int label)
+{
+  cl_int err_num;
+  cl_event read_done;
+  int size;
+
+  size_t global_worksize[2], local_worksize[2];
+
+  size = width * height;
+
+  local_worksize[0] = 16;
+  local_worksize[1] = 16;
+  global_worksize[0] = round_worksize_up(local_worksize[0], width);
+  global_worksize[1] = round_worksize_up(local_worksize[1], height);
+
+  err_num = CL_SUCCESS;
+
+  err_num |= clSetKernelArg (data->make_graph_kernel, 0, sizeof(cl_mem),
+        &(data->buffer_matrix_device));
+  err_num |= clSetKernelArg (data->make_graph_kernel, 1, sizeof(cl_mem),
+        &(data->labels_matrix_device));
+  err_num |= clSetKernelArg (data->make_graph_kernel, 2, sizeof(cl_mem),
+        &(data->edge_matrix_device));
+  err_num |= clSetKernelArg (data->make_graph_kernel, 3, sizeof(cl_mem),
+        &(data->weight_matrix_device));
+  err_num |= clSetKernelArg (data->make_graph_kernel, 4, sizeof(gint),
+        &(width));
+  err_num |= clSetKernelArg (data->make_graph_kernel, 5, sizeof(gint),
+        &(height));
+  err_num |= clSetKernelArg (data->make_graph_kernel, 6, sizeof(gint),
+        &(label));
+  check_error (err_num, CL_SUCCESS);
+
+  err_num = clEnqueueNDRangeKernel (data->command_queue,
+      data->make_graph_kernel, 2, NULL, global_worksize, local_worksize, 0,
+      NULL, NULL);
+  check_error (err_num, CL_SUCCESS);
+
+  err_num = clEnqueueReadBuffer (data->command_queue, data->edge_matrix_device,
+      CL_FALSE, 0, sizeof(gint) * size * 8, data->edge_matrix, 0, NULL, &read_done);
+  check_error (err_num, CL_SUCCESS);
+
+  clWaitForEvents (1, &read_done);
+
+  err_num = clEnqueueReadBuffer (data->command_queue, data->weight_matrix_device,
+      CL_FALSE, 0, sizeof(gint) * size * 8, data->weight_matrix, 0, NULL, &read_done);
+  check_error (err_num, CL_SUCCESS);
+
+  clWaitForEvents (1, &read_done);
 }
 
 int main(int argc, char **argv)
@@ -599,6 +663,7 @@ int main(int argc, char **argv)
   }
 
   oclCclData *data = NULL;
+  int i, j;
 
   if (clutter_init (&argc, &argv) != CLUTTER_INIT_SUCCESS)
     return -1;
@@ -611,14 +676,59 @@ int main(int argc, char **argv)
 
   buffer = reduce_depth_file(argv[1], 16, &reduced_width, &reduced_height);
 
+  printf("BUFFER:\n\n");
+
+  for (i=0; i<reduced_width; i++)
+    {
+      for (j=0; j<reduced_height; j++)
+        {
+          printf("%d\t", buffer[j * reduced_width + i]);
+        }
+      printf("\n");
+    }
+
+  printf("\n\n");
+
   ocl_init (data, reduced_width * reduced_height);
 
   ocl_ccl (data, buffer, reduced_width, reduced_height);
 
-  int i, j;
+  guint *histogram = g_slice_alloc0(sizeof(guint) * reduced_width *
+      reduced_height);
+
+  guint biggest = 0;
+
   for (i=0; i<reduced_width; i++) {
     for (j=0; j<reduced_height; j++) {
-      printf("%u ", data->labels_matrix[j*reduced_width + i]);
+      printf("%d\t", data->labels_matrix[j*reduced_width + i]);
+      if (data->labels_matrix[j*reduced_width + i] == 0)
+        continue;
+      histogram[data->labels_matrix[j*reduced_width + i]]++;
+      if (histogram[data->labels_matrix[j*reduced_width + i]] > biggest)
+        biggest = data->labels_matrix[j*reduced_width + i];
+    }
+    printf("\n");
+  }
+
+  g_slice_free1 (sizeof(guint) * reduced_width * reduced_height, histogram);
+
+  printf("biggest = %d\n", biggest);
+
+  ocl_make_graph (data, reduced_width, reduced_height, biggest);
+
+  printf("\n\n\n");
+
+  for (i=0; i<reduced_width; i++) {
+    for (j=0; j<reduced_height; j++) {
+      /*if (data->edge_matrix[(j * reduced_width + i) * 8] != -1)
+        {
+          printf("* ");
+        }
+      else
+        {
+          printf("%d ", -1);
+        }*/
+      printf("%d\t", data->weight_matrix[(j * reduced_width + i) * 8]);
     }
     printf("\n");
   }
